@@ -183,3 +183,4 @@ cython_debug/
 bert-ner-finetuned/
 my-ner-model/
 .cache/
+roberta-ner-finetuned/

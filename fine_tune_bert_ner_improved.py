@@ -1,20 +1,26 @@
 """
-Fine-tune BERT model on CoNLL-2003 NER dataset
-This script demonstrates how to fine-tune a pre-trained BERT model for NER
+Improved NER fine-tuning: RoBERTa-base with tuned hyperparameters.
+Changes vs fine_tune_bert_ner.py:
+  - model: roberta-base  (vs bert-base-cased)
+  - label_all_tokens: False  (vs True)
+  - learning_rate: 3e-5  (vs 2e-5)
+  - num_train_epochs: 5  (vs 3)
+  - batch_size: 32  (vs 16)
 """
 
 import numpy as np
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForTokenClassification,
     DataCollatorForTokenClassification,
     TrainingArguments,
-    Trainer
+    Trainer,
 )
 from seqeval.metrics import classification_report
 from seqeval.scheme import IOB2
 import torch
+
 
 def load_conll_dataset():
     """Load CoNLL-2003 from tner/conll2003 (plain JSONL, no loading script)."""
@@ -44,39 +50,35 @@ def load_conll_dataset():
         return dataset
     except Exception as e:
         print(f"Could not load dataset: {e}")
-    print("\nAll dataset sources failed. Skipping dataset loading.")
+    print("All sources failed. Using default labels only.")
     return None
 
-def tokenize_and_align_labels(examples, tokenizer, label_all_tokens=True):
-    """Tokenize and align labels with tokens"""
+
+def tokenize_and_align_labels(examples, tokenizer):
     tokenized_inputs = tokenizer(
         examples["tokens"],
         truncation=True,
-        is_split_into_words=True
+        is_split_into_words=True,
     )
-    
     labels = []
     for i, label in enumerate(examples["ner_tags"]):
         word_ids = tokenized_inputs.word_ids(batch_index=i)
         previous_word_idx = None
         label_ids = []
-        
         for word_idx in word_ids:
             if word_idx is None:
                 label_ids.append(-100)
             elif word_idx != previous_word_idx:
                 label_ids.append(label[word_idx])
             else:
-                label_ids.append(label[word_idx] if label_all_tokens else -100)
+                label_ids.append(-100)  # mask continuation sub-tokens
             previous_word_idx = word_idx
-        
         labels.append(label_ids)
-    
     tokenized_inputs["labels"] = labels
     return tokenized_inputs
 
+
 def compute_metrics(p, label_list):
-    """Compute metrics for evaluation"""
     predictions, labels = p
     predictions = np.argmax(predictions, axis=2)
 
@@ -89,74 +91,69 @@ def compute_metrics(p, label_list):
         for prediction, label in zip(predictions, labels)
     ]
 
-    report = classification_report(true_labels, true_predictions, mode='strict', scheme=IOB2, output_dict=True)
+    report = classification_report(
+        true_labels, true_predictions, mode="strict", scheme=IOB2, output_dict=True
+    )
     print("\nClassification Report:")
-    print(classification_report(true_labels, true_predictions, mode='strict', scheme=IOB2))
-
+    print(classification_report(true_labels, true_predictions, mode="strict", scheme=IOB2))
     return {
         "precision": report["macro avg"]["precision"],
-        "recall": report["macro avg"]["recall"],
-        "f1": report["macro avg"]["f1-score"],
+        "recall":    report["macro avg"]["recall"],
+        "f1":        report["macro avg"]["f1-score"],
     }
 
-def fine_tune_bert():
-    """Main function to fine-tune BERT for NER"""
+
+def fine_tune_roberta():
     print("=" * 60)
-    print("Fine-tuning BERT for Named Entity Recognition")
+    print("Fine-tuning RoBERTa for Named Entity Recognition (Improved)")
     print("=" * 60)
-    
-    # Load dataset
+
     dataset = load_conll_dataset()
 
     # tner/conll2003 label order (from dataset/label.json)
-    label_list = ['O', 'B-ORG', 'B-MISC', 'B-PER', 'I-PER', 'B-LOC', 'I-ORG', 'I-MISC', 'I-LOC']
+    label_list = ["O", "B-ORG", "B-MISC", "B-PER", "I-PER", "B-LOC", "I-ORG", "I-MISC", "I-LOC"]
 
     print(f"\nLabel list: {label_list}")
     print(f"Number of labels: {len(label_list)}")
-    
-    # Load tokenizer and model
-    model_name = "bert-base-cased"
+
+    model_name = "roberta-base"
     print(f"\nLoading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, add_prefix_space=True)
     model = AutoModelForTokenClassification.from_pretrained(
         model_name,
-        num_labels=len(label_list)
+        num_labels=len(label_list),
     )
-    
-    # Tokenize dataset (only when data is available)
+
     tokenized_datasets = None
     if dataset is not None:
         print("\nTokenizing dataset...")
         tokenized_datasets = dataset.map(
             lambda x: tokenize_and_align_labels(x, tokenizer),
             batched=True,
-            remove_columns=dataset["train"].column_names
+            remove_columns=dataset["train"].column_names,
         )
     else:
         print("\nSkipping tokenization - dataset not loaded.")
 
-    # Data collator
     data_collator = DataCollatorForTokenClassification(tokenizer)
 
-    # Training arguments
     training_args = TrainingArguments(
-        output_dir="./bert-ner-finetuned",
+        output_dir="./roberta-ner-finetuned",
         eval_strategy="epoch",
         save_strategy="epoch",
-        learning_rate=2e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=3,
+        learning_rate=3e-5,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
+        num_train_epochs=5,
         weight_decay=0.01,
         warmup_ratio=0.1,
         push_to_hub=False,
         logging_steps=50,
         save_total_limit=2,
         load_best_model_at_end=True,
-        metric_for_best_model="f1"
+        metric_for_best_model="f1",
     )
-    
-    # Initialize trainer (only when tokenized data is available)
+
     trainer = None
     if tokenized_datasets is not None:
         trainer = Trainer(
@@ -166,15 +163,16 @@ def fine_tune_bert():
             eval_dataset=tokenized_datasets["validation"],
             tokenizer=tokenizer,
             data_collator=data_collator,
-            compute_metrics=lambda p: compute_metrics(p, label_list)
+            compute_metrics=lambda p: compute_metrics(p, label_list),
         )
+
         print("\nStarting training...")
         trainer.train()
 
         print("\nEvaluating on test set...")
         test_results = trainer.evaluate(tokenized_datasets["test"])
         print("\n" + "=" * 60)
-        print("BASELINE MODEL - TEST RESULTS")
+        print("IMPROVED MODEL - TEST RESULTS")
         print("=" * 60)
         print(f"  Precision : {test_results['eval_precision']:.4f}")
         print(f"  Recall    : {test_results['eval_recall']:.4f}")
@@ -183,69 +181,8 @@ def fine_tune_bert():
     else:
         print("\nTrainer not initialised - no tokenized dataset available.")
 
-    print("\n" + "=" * 60)
-    print("Training setup complete!")
-    print("=" * 60)
-
     return trainer, tokenizer, label_list
 
-def test_fine_tuned_model(trainer, tokenizer, label_list):
-    """Test the fine-tuned model on sample text"""
-    print("\n" + "=" * 60)
-    print("Testing Fine-tuned Model")
-    print("=" * 60)
-    
-    sample_text = "Tesla opened a new Gigafactory in Austin, Texas, investing over $5 billion in the facility."
-    
-    tokens = tokenizer(sample_text, return_tensors="pt")
-    tokens = {k: v.to(trainer.model.device) for k, v in tokens.items()}
-
-    with torch.no_grad():
-        outputs = trainer.model(**tokens)
-    
-    predictions = outputs.logits.argmax(dim=-1)
-    
-    # Convert to labels
-    tokens_list = tokenizer.convert_ids_to_tokens(tokens["input_ids"][0])
-    predictions_list = [label_list[p] for p in predictions[0]]
-    
-    print(f"\nText: {sample_text}")
-    print("\nToken-level predictions:")
-    for token, label in zip(tokens_list, predictions_list):
-        print(f"  {token:15} | {label}")
-    
-    # Group entities
-    entities = []
-    current_entity = None
-    current_tokens = []
-    
-    for token, label in zip(tokens_list, predictions_list):
-        if label == "O":
-            if current_entity:
-                entities.append((current_entity, "".join(current_tokens)))
-                current_entity = None
-                current_tokens = []
-        elif label.startswith("B-"):
-            if current_entity:
-                entities.append((current_entity, "".join(current_tokens)))
-            current_entity = label[2:]
-            current_tokens = [token.replace("##", "")]
-        elif label.startswith("I-"):
-            if current_entity:
-                current_tokens.append(token.replace("##", ""))
-            else:
-                current_entity = label[2:]
-                current_tokens = [token.replace("##", "")]
-    
-    if current_entity:
-        entities.append((current_entity, "".join(current_tokens)))
-    
-    print("\nExtracted entities:")
-    for entity_type, entity_text in entities:
-        print(f"  - {entity_text:20} | {entity_type}")
 
 if __name__ == "__main__":
-    trainer, tokenizer, label_list = fine_tune_bert()
-    
-    # Uncomment to test the model after training
-    # test_fine_tuned_model(trainer, tokenizer, label_list)
+    fine_tune_roberta()
